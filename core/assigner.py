@@ -19,6 +19,9 @@ class Params:
     segment_id: str = "segment_id"
     oh_filter_expr: Optional[str] = None  # e.g., "STRUCTURE == 'OH'"
     hfra_only: bool = False
+    top_n: int = 1
+    check_elevation: bool = True
+    group_by_col: str = "segment" # 'segment' or 'station'
 
 def filter_oh_segments(segments: gpd.GeoDataFrame, expr: Optional[str]) -> gpd.GeoDataFrame:
     if expr:
@@ -123,7 +126,9 @@ def generate_candidates_one_to_many(
                 # Strict rule: must be within range. If Null, check skipped (Analysis continues).
                 # We categorize as PASS for the sake of not filtering them out, 
                 # relying on downstream logic or users to see null elevation fields.
-                if pd.isna(z) or pd.isna(zmin) or pd.isna(zmax):
+                if not params.check_elevation:
+                    elev_pass = True
+                elif pd.isna(z) or pd.isna(zmin) or pd.isna(zmax):
                     elev_pass = True
                 else:
                     elev_pass = (z >= (zmin - params.elev_tol_ft)) and (z <= (zmax + params.elev_tol_ft))
@@ -163,10 +168,22 @@ def select_best_match(cand: gpd.GeoDataFrame, params: Params) -> gpd.GeoDataFram
     cand["elev_delta_abs_ft"] = cand.apply(calc_delta, axis=1)
 
     # Sort: elev_pass desc (True > False), distance asc, elev_delta asc, segment_id asc
+    # If grouping by segment, we might want to prioritize station_id in sort for determinism
+    sort_cols = ["elev_pass", "distance_m", "elev_delta_abs_ft", params.segment_id, params.station_id]
+    asc_order = [False, True, True, True, True]
+    
     cand_sorted = cand.sort_values(
-        by=["elev_pass", "distance_m", "elev_delta_abs_ft", params.segment_id],
-        ascending=[False, True, True, True]
+        by=sort_cols,
+        ascending=asc_order
     )
-    # Drop duplicates keeping first per station
-    best = cand_sorted.drop_duplicates(subset=[params.station_id], keep="first")
+    
+    # Determine grouping column
+    group_col = params.segment_id if params.group_by_col == "segment" else params.station_id
+
+    # Return top N per group
+    if params.top_n == 1:
+        best = cand_sorted.drop_duplicates(subset=[group_col], keep="first")
+    else:
+        best = cand_sorted.groupby(group_col).head(params.top_n)
+    
     return best

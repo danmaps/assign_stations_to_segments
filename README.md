@@ -1,9 +1,9 @@
-# Assign Points to Linear Features
+# Get Points Closest to Lines
 
-A tool to assign points (e.g., weather stations, assets) to the nearest linear features (e.g., distribution segments, roads) based on distance and elevation rules.
+A tool to identify points (e.g., weather stations, assets) that are closest to linear features (e.g., distribution segments, roads) based on distance and elevation rules.
 
 ## Features
-- **One-to-many** assignment: Finds all line segments within a configured distance (e.g., 0.5 miles).
+- **Find closest matches**: Identifies line segments closest to each point within a configured distance (e.g., 0.5 miles).
 - **Elevation check**: Validates if point elevation is within the line segment's elevation range ± tolerance.
 - **Support for various inputs**: Shapefile, GeoJSON, GeoPackage, CSV (with lat/lon), and ArcGIS Service URLs.
 - **Interactive UI**: Streamlit app for easy uploading, parameter tuning, and visualization.

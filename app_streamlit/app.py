@@ -14,12 +14,19 @@ current_dir = Path(__file__).parent
 root_dir = current_dir.parent
 sys.path.append(str(root_dir))
 
+# Force reload of core modules to pick up changes during development
+import importlib
+import core.assigner
+importlib.reload(core.assigner)
+
 from core.io_utils import read_vector
 from core.crs_utils import to_utm
 from core.assigner import (
     Params, filter_oh_segments, restrict_to_hfra,
     ensure_elevation_fields, generate_candidates_one_to_many, select_best_match
 )
+from shapely.ops import nearest_points
+
 
 def save_uploaded_file(uploaded_file):
     if uploaded_file is None:
@@ -34,14 +41,27 @@ def save_uploaded_file(uploaded_file):
         tmp_file.write(uploaded_file.getvalue())
         return tmp_file.name
 
-st.set_page_config(page_title="Point→Linear Feature Assignment", layout="wide")
+st.set_page_config(page_title="Get Points Closest to Lines", layout="wide")
 
-st.title("Assign Points to Nearest Linear Features")
-st.caption("Matches points to lines based on distance and optional elevation criteria.")
+st.title("Get Points Closest to Lines")
+st.caption("Identify points that are within a tolerance distance of linear features.")
 
 # Sidebar controls
-distance_miles = st.sidebar.slider("Distance threshold (miles)", 0.1, 5.0, 0.5, 0.1)
-elev_tol_ft = st.sidebar.slider("Elevation tolerance (feet)", 100, 2000, 500, 50)
+use_dist_filter = st.sidebar.checkbox("Filter by Distance", value=True)
+if use_dist_filter:
+    distance_miles = st.sidebar.slider("Distance threshold (miles)", 0.1, 5.0, 0.5, 0.1)
+else:
+    st.sidebar.info("Distance filter disabled (using 50 mile search radius)")
+    distance_miles = 50.0
+
+use_elev_filter = st.sidebar.checkbox("Filter by Elevation", value=True)
+if use_elev_filter:
+    elev_tol_ft = st.sidebar.slider("Elevation tolerance (feet)", 100, 2000, 500, 50)
+else:
+    elev_tol_ft = 500.0 # Value doesn't matter if check is False
+
+top_n = st.sidebar.number_input("Top N matches to keep", min_value=1, max_value=100, value=1)
+
 station_id = st.sidebar.text_input("Point ID field", "station_id", help="Column name for unique ID in points dataset")
 segment_id = st.sidebar.text_input("Line ID field", "segment_id", help="Column name for unique ID in lines dataset")
 oh_filter_expr = st.sidebar.text_input("Line filter expression (optional)", "", help="Pandas query expression e.g., `STRUCTURE == 'OH'`")
@@ -146,7 +166,11 @@ if st.session_state.run_analysis:
                 try:
                     params = Params(distance_miles=distance_miles, elev_tol_ft=elev_tol_ft,
                                     station_id=station_id, segment_id=segment_id,
-                                    oh_filter_expr=oh_filter_expr if oh_filter_expr.strip() else None)
+                                    oh_filter_expr=oh_filter_expr if oh_filter_expr.strip() else None,
+                                    top_n=top_n,
+                                    check_elevation=use_elev_filter,
+                                    group_by_col="segment") # Hardcoded to segment-centric based on requirements
+
 
                     segments_oh = filter_oh_segments(segments, params.oh_filter_expr)
                     if hfra is not None:
@@ -169,69 +193,163 @@ if st.session_state.run_analysis:
                     cand = generate_candidates_one_to_many(stations_utm, segments_utm, params)
                     best = select_best_match(cand, params)
                     
-                    st.subheader("Results")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.write(f"One-to-many candidates ({len(cand)})")
-                        st.dataframe(cand.head(100))
-                        st.download_button("Download candidates CSV", data=cand.to_csv(index=False), file_name="candidates.csv")
-                    with c2:
-                        st.write(f"Best match per station ({len(best)})")
-                        st.dataframe(best.head(100))
-                        st.download_button("Download best-match CSV", data=best.to_csv(index=False), file_name="best_match.csv")
-
-                    # Map preview (Folium)
-                    st.subheader("Map preview")
-                    
-                    # Convert to WGS84 for mapping
-                    # Handle empty results
-                    if not stations.empty:
-                         # Center map
-                         center_lat = stations.to_crs(4326).geometry.y.mean()
-                         center_lon = stations.to_crs(4326).geometry.x.mean()
-                         m = folium.Map(tiles="cartodb-dark-matter", location=[center_lat, center_lon], zoom_start=10)
-                    else:
-                         m = folium.Map(tiles="cartodb-dark-matter", zoom_start=10)
-
-                    # Add OH segments (simplify for display if needed)
-                    # Filter OH segments for map
-                    if not segments_oh.empty:
-                        seg_geo = segments_oh.to_crs(4326)
-                        if len(seg_geo) > 2000:
-                             st.warning("Many segments. Mapping first 2000.")
-                             seg_geo = seg_geo.iloc[:2000]
-
-                        col_tooltip = [segment_id] if segment_id in seg_geo.columns else []
-                        folium.GeoJson(
-                            seg_geo,
-                            name="OH segments",
-                            style_function=lambda x: {"color": "#ffb703", "weight": 2},
-                            tooltip=folium.GeoJsonTooltip(fields=col_tooltip) if col_tooltip else None
-                        ).add_to(m)
-                    
-                    # Add stations
-                    if not stations.empty:
-                        stations_map = stations
-                        if len(stations) > 1000:
-                            st.warning("Large dataset detected. Mapping first 1000 stations.")
-                            stations_map = stations.iloc[:1000]
-                        
-                        st_geo = stations_map.to_crs(4326)
-                        for _, r in st_geo.iterrows():
-                            # safely get id
-                            s_id = r[station_id] if station_id in r else "Station"
-                            folium.CircleMarker(
-                                location=(r.geometry.y, r.geometry.x),
-                                radius=4,
-                                color="cyan",
-                                fill=True,
-                                tooltip=str(s_id)
-                            ).add_to(m)
-
-                    folium.LayerControl().add_to(m)
-                    st_folium(m, height=600, width=None)
+                    # Store results in session state
+                    st.session_state.results = {
+                        "cand": cand,
+                        "best": best,
+                        "stations": stations,
+                        "segments_oh": segments_oh,
+                        "params": params
+                    }
                     
                 except Exception as e:
                     st.error(f"Error during processing: {e}")
                     import traceback
                     traceback.print_exc()
+
+if "results" in st.session_state and st.session_state.results is not None:
+    res = st.session_state.results
+    cand = res["cand"]
+    best = res["best"]
+    stations = res["stations"]
+    segments_oh = res["segments_oh"]
+    params = res["params"]
+
+    st.subheader("Results")
+    
+    # Primary Output: The Assignment Results
+    title_suffix = f" (Top {top_n})" if top_n > 1 else ""
+    st.markdown(f"**Assignment Results{title_suffix}** ({len(best)} matches - grouped by Line)")
+    st.dataframe(best.head(500))
+    st.download_button("Download results CSV", data=best.to_csv(index=False), file_name="assignment_results.csv")
+
+    # Debug/Detailed Output: Raw Candidates
+    with st.expander(f"View all raw candidates within search radius ({len(cand)})"):
+        st.write("These are all segments that passed the distance (and optional elevation) filter, before Top N selection.")
+        st.dataframe(cand.head(500))
+        st.download_button("Download candidates CSV", data=cand.to_csv(index=False), file_name="candidates_raw.csv")
+
+    # Map preview (Folium)
+    st.subheader("Map preview")
+    
+    # Convert to WGS84 for mapping
+    # Handle empty results
+    if not stations.empty:
+            # Center map
+            stations_wgs = stations.to_crs(4326)
+            center_lat = stations_wgs.geometry.y.mean()
+            center_lon = stations_wgs.geometry.x.mean()
+            m = folium.Map(tiles="cartodb-dark-matter", location=[center_lat, center_lon], zoom_start=10)
+    else:
+            m = folium.Map(tiles="cartodb-dark-matter", zoom_start=10)
+
+    # Add OH segments (simplify for display if needed)
+    # Filter OH segments for map
+    if not segments_oh.empty:
+        seg_geo = segments_oh.to_crs(4326)
+        
+        # Enrich segments with list of matched points for tooltip
+        # Group 'best' by segment_id and aggregate station_ids
+        if not best.empty:
+            # Explicitly select only necessary columns to avoid overhead
+            best_slim = best[[params.segment_id, params.station_id]].copy()
+            # Convert station_id to string to ensure join works
+            best_slim[params.station_id] = best_slim[params.station_id].astype(str)
+            
+            # Aggregate: "id1, id2, id3"
+            seg_matches = best_slim.groupby(params.segment_id)[params.station_id].apply(lambda x: ", ".join(x)).reset_index()
+            seg_matches.rename(columns={params.station_id: "matched_points"}, inplace=True)
+            
+            # Merge into seg_geo
+            # Ensure dtypes match for merge
+            seg_geo[params.segment_id] = seg_geo[params.segment_id].astype(str)
+            seg_matches[params.segment_id] = seg_matches[params.segment_id].astype(str)
+            
+            seg_geo = seg_geo.merge(seg_matches, on=params.segment_id, how="left")
+            seg_geo["matched_points"] = seg_geo["matched_points"].fillna("")
+        
+        # Performance check
+        if len(seg_geo) > 2000:
+                st.warning("Many lines. Mapping first 2000.")
+                seg_geo = seg_geo.iloc[:2000]
+
+        cols = seg_geo.columns
+        # Re-get segment_id from sidebar context or use whatever was saved in params if we saved params
+        # But segment_id is available in global scope here from the sidebar widget
+        
+        # Add 'matched_points' to tooltip
+        possible_cols = [segment_id, "matched_points"]
+        col_tooltip = [c for c in possible_cols if c in cols]
+        
+        folium.GeoJson(
+            seg_geo,
+            name="Lines",
+            style_function=lambda x: {"color": "#ffb703", "weight": 2},
+            tooltip=folium.GeoJsonTooltip(fields=col_tooltip, aliases=[f"{segment_id}:", "Closest Points:"]) if col_tooltip else None
+        ).add_to(m)
+        
+    # Add Connection Lines (Spider Lines)
+    if not best.empty and not stations.empty and not segments_oh.empty:
+        # Create a dictionary for geometry lookups (using WGS84)
+        # We need the full set of stations and lines to look up geometries for the 'best' subset
+        st_lookup = stations.to_crs(4326).set_index(params.station_id).geometry
+        seg_lookup = segments_oh.to_crs(4326).set_index(params.segment_id).geometry
+        
+        connections_fg = folium.FeatureGroup(name="Connections", show=True)
+        
+        # Limit connections to prevent browser crash if many
+        limit_conn = 5000
+        best_plot = best.head(limit_conn)
+        if len(best) > limit_conn:
+            st.warning(f"Displaying connections for first {limit_conn} matches only.")
+            
+        for idx, row in best_plot.iterrows():
+            sid = str(row[params.station_id])
+            lid = str(row[params.segment_id])
+            
+            if sid in st_lookup.index and lid in seg_lookup.index:
+                pt_geom = st_lookup.loc[sid]
+                # If duplicate IDs exist, we might get a Series. Take first.
+                if isinstance(pt_geom, gpd.GeoSeries): pt_geom = pt_geom.iloc[0]
+                
+                line_geom = seg_lookup.loc[lid]
+                if isinstance(line_geom, gpd.GeoSeries): line_geom = line_geom.iloc[0]
+                
+                # Calculate nearest point on line to the station point
+                # nearest_points returns (p1, p2) where p1 is on geom1 and p2 on geom2
+                # Note: This is purely geometric 'nearest'. 
+                p_on_pt, p_on_line = nearest_points(pt_geom, line_geom)
+                
+                line_coords = [(p_on_pt.y, p_on_pt.x), (p_on_line.y, p_on_line.x)]
+                
+                folium.PolyLine(
+                    locations=line_coords,
+                    color="cyan",
+                    weight=1,
+                    opacity=0.6,
+                    dash_array="5, 10"
+                ).add_to(connections_fg)
+        
+        connections_fg.add_to(m)
+    
+    # Add stations
+    if not stations.empty:
+        stations_map = stations
+        if len(stations) > 1000:
+            st.warning("Large dataset detected. Mapping first 1000 points.")
+            stations_map = stations.iloc[:1000]
+        
+        st_geo = stations_map.to_crs(4326)
+        for _, r in st_geo.iterrows():
+            # safely get id
+            s_id = r[station_id] if station_id in r else "Point"
+            folium.CircleMarker(
+                location=(r.geometry.y, r.geometry.x),
+                radius=4,
+                color="cyan",
+                fill=True,
+                tooltip=str(s_id)
+            ).add_to(m)
+
+    folium.LayerControl().add_to(m)
+    st_folium(m, height=600, width=None)
