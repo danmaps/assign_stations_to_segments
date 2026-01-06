@@ -15,7 +15,7 @@ elevs = [100.0, 150.0, 90.0, 110.0, 160.0]  # Feet
 
 stations = gpd.GeoDataFrame({
     "station_id": ids,
-    "elevation_ft": elevs,
+    "station_elev_ft": elevs,
     "type": ["Weather"] * 5
 }, geometry=[Point(xy) for xy in zip(lons, lats)], crs="EPSG:4326")
 
@@ -44,8 +44,8 @@ for i, lon in enumerate([-118.495, -118.490, -118.485]):
 
 segments = gpd.GeoDataFrame({
     "segment_id": seg_ids,
-    "min_elev_ft": min_zs,
-    "max_elev_ft": max_zs,
+    "seg_min_elev_ft": min_zs,
+    "seg_max_elev_ft": max_zs,
     "STRUCTURE": ["OH"] * len(lines)  # Match default filter
 }, geometry=lines, crs="EPSG:4326")
 

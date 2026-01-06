@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import numpy as np
+import pandas as pd
 import geopandas as gpd
 from shapely.strtree import STRtree
 from shapely import prepared
